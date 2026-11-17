@@ -341,11 +341,15 @@ type PredictLongRunningRequest struct {
 	Parameters *VideoParameters `json:"parameters,omitempty"`
 }
 
-// VideoInstance is one video request; only the text prompt is supported.
+// VideoInstance is one video request. Prompt is required; Image and LastFrame
+// optionally carry reference images ({bytesBase64Encoded, mimeType}) that guide
+// the generation. The Videos tool has no hard keyframe conditioning, so
+// LastFrame is passed as a trailing reference image, not a strict end frame.
 type VideoInstance struct {
-	Prompt string          `json:"prompt"`
-	Image  json.RawMessage `json:"image,omitempty"`
-	Video  json.RawMessage `json:"video,omitempty"`
+	Prompt   string          `json:"prompt"`
+	Image    json.RawMessage `json:"image,omitempty"`
+	LastFrame json.RawMessage `json:"lastFrame,omitempty"`
+	Video    json.RawMessage `json:"video,omitempty"`
 }
 
 // VideoParameters holds generation options. Only aspectRatio and sampleCount

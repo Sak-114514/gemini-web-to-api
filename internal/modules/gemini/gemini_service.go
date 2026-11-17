@@ -424,8 +424,19 @@ func (s *GeminiService) StartVideoOperation(model string, req dto.PredictLongRun
 		return nil, &providers.VideoValidationError{Message: "exactly one instance is required"}
 	}
 	instance := req.Instances[0]
-	if len(instance.Image) > 0 || len(instance.Video) > 0 {
-		return nil, &providers.VideoValidationError{Message: "image and video inputs are not supported; only text-to-video is available"}
+	if len(instance.Video) > 0 {
+		return nil, &providers.VideoValidationError{Message: "video inputs are not supported"}
+	}
+	files := make([]providers.InputFile, 0, 2)
+	for name, raw := range map[string]json.RawMessage{"image": instance.Image, "lastFrame": instance.LastFrame} {
+		if len(raw) == 0 {
+			continue
+		}
+		file, err := videoReferenceFromRaw(name, raw)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, file)
 	}
 	aspectRatio := ""
 	if req.Parameters != nil {
@@ -438,11 +449,35 @@ func (s *GeminiService) StartVideoOperation(model string, req dto.PredictLongRun
 	if err != nil {
 		return nil, err
 	}
-	job, err := s.client.StartVideoJob(instance.Prompt, model, aspect)
+	job, err := s.client.StartVideoJob(instance.Prompt, model, aspect, files)
 	if err != nil {
 		return nil, err
 	}
 	return &dto.VideoOperation{Name: videoOperationName(model, job.ID)}, nil
+}
+
+// videoReferenceFromRaw decodes an instance image field ({bytesBase64Encoded,
+// mimeType}); gcsUri and other remote references are rejected.
+func videoReferenceFromRaw(name string, raw json.RawMessage) (providers.InputFile, error) {
+	var image struct {
+		BytesBase64Encoded string `json:"bytesBase64Encoded"`
+		MimeType           string `json:"mimeType,omitempty"`
+		GcsURI             string `json:"gcsUri,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &image); err != nil {
+		return providers.InputFile{}, &providers.VideoValidationError{Message: fmt.Sprintf("%s must be an image object with bytesBase64Encoded", name)}
+	}
+	if image.GcsURI != "" {
+		return providers.InputFile{}, &providers.VideoValidationError{Message: "gcsUri references are not supported; inline the image with bytesBase64Encoded"}
+	}
+	if strings.TrimSpace(image.BytesBase64Encoded) == "" {
+		return providers.InputFile{}, &providers.VideoValidationError{Message: fmt.Sprintf("%s.bytesBase64Encoded is required", name)}
+	}
+	data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(image.BytesBase64Encoded))
+	if err != nil {
+		return providers.InputFile{}, &providers.VideoValidationError{Message: fmt.Sprintf("%s.bytesBase64Encoded is not valid base64", name)}
+	}
+	return providers.InputFile{Name: name + ".png", MimeType: image.MimeType, Data: data}, nil
 }
 
 // GetVideoOperation reports a video job as a long-running operation. fileBaseURL

@@ -1,0 +1,25 @@
+{
+  "scheduler": {
+    "selection": "random",
+    "max_concurrent_per_account": 3,
+    "max_concurrent_per_account_cap": 5,
+    "submit_interval_seconds_min": 30,
+    "submit_interval_seconds_max": 120,
+    "bot_protection_cooldown_seconds": 180,
+    "quota_exclusion_hours": 6
+  },
+  "accounts": [
+    {
+      "id": "acc-ma",
+      "cookies": "__Secure-1PSID=粘贴完整Cookie头; __Secure-1PSIDTS=...; NID=...; ...",
+      "auth_user": "",
+      "proxy_url": "http://host.docker.internal:7897"
+    },
+    {
+      "id": "acc-us",
+      "cookies": "另一个号的完整 Cookie 头",
+      "auth_user": "",
+      "proxy_url": "socks5://用户名:密码@us-isp-host:端口"
+    }
+  ]
+}

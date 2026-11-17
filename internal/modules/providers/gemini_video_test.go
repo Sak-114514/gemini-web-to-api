@@ -166,7 +166,7 @@ func TestGenerateVideoSubmitsOncePollsAndDownloads(t *testing.T) {
 
 	client := &Client{at: "test-token", cookieHeader: "session=test-cookie", cachedModels: generationTestModels(),
 		language: "en", authUser: "2", log: zap.NewNop(), maxRetries: 3, defaultTemporary: true}
-	result, err := client.GenerateVideo(context.Background(), "A cat", "gemini-pro", VideoAspectLandscape, time.Millisecond)
+	result, err := client.GenerateVideo(context.Background(), "A cat", "gemini-pro", VideoAspectLandscape, nil, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestGenerateVideoReportsQuotaWithoutPolling(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: r}, nil
 	})
 	client := &Client{at: "test-token", cookieHeader: "c", cachedModels: generationTestModels(), language: "en", log: zap.NewNop()}
-	_, err := client.GenerateVideo(context.Background(), "A cat", "", VideoAspectLandscape, time.Millisecond)
+	_, err := client.GenerateVideo(context.Background(), "A cat", "", VideoAspectLandscape, nil, time.Millisecond)
 	var videoErr *VideoError
 	if !errors.As(err, &videoErr) || videoErr.Code != VideoErrorQuota {
 		t.Fatalf("expected quota error, got %v", err)
@@ -221,7 +221,7 @@ type fakeVideoRun struct {
 	err     error
 }
 
-func (f *fakeVideoRun) generate(ctx context.Context, prompt, model string, aspect VideoAspectRatio) (*VideoResult, error) {
+func (f *fakeVideoRun) generate(ctx context.Context, prompt, model string, aspect VideoAspectRatio, files []InputFile) (*VideoResult, error) {
 	f.model, f.aspect = model, aspect
 	select {
 	case <-f.release:
@@ -277,11 +277,11 @@ func TestVideoJobLifecycle(t *testing.T) {
 	c := NewVideoTestClient([]ModelInfo{{ID: "gemini-flash"}, {ID: "gemini-pro"}}, run.generate)
 	defer c.videoJobStore().close()
 
-	job, err := c.StartVideoJob(" A cat ", "veo-3.0-generate-001", VideoAspectPortrait)
+	job, err := c.StartVideoJob(" A cat ", "veo-3.0-generate-001", VideoAspectPortrait, nil)
 	if err != nil || job.Status != VideoJobInProgress || job.Prompt != "A cat" || job.Model != "gemini-flash" || job.Size() != "720x1280" {
 		t.Fatalf("job=%#v err=%v", job, err)
 	}
-	if _, err := c.StartVideoJob("Another", "", VideoAspectLandscape); !errors.Is(err, ErrVideoBusy) {
+	if _, err := c.StartVideoJob("Another", "", VideoAspectLandscape, nil); !errors.Is(err, ErrVideoBusy) {
 		t.Fatalf("concurrent job must be rejected, got %v", err)
 	}
 	if _, _, err := c.VideoJobContent(job.ID); !errors.Is(err, ErrVideoNotReady) {
@@ -315,7 +315,7 @@ func TestVideoJobFailureKeepsProviderError(t *testing.T) {
 	close(run.release)
 	c := NewVideoTestClient([]ModelInfo{{ID: "gemini-pro"}}, run.generate)
 	defer c.videoJobStore().close()
-	job, err := c.StartVideoJob("A cat", "gemini-pro", VideoAspectLandscape)
+	job, err := c.StartVideoJob("A cat", "gemini-pro", VideoAspectLandscape, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,11 +329,11 @@ func TestVideoJobValidation(t *testing.T) {
 	c := NewVideoTestClient([]ModelInfo{{ID: "gemini-pro"}}, (&fakeVideoRun{release: make(chan struct{})}).generate)
 	defer c.videoJobStore().close()
 	var validationErr *VideoValidationError
-	if _, err := c.StartVideoJob("  ", "", VideoAspectLandscape); !errors.As(err, &validationErr) {
+	if _, err := c.StartVideoJob("  ", "", VideoAspectLandscape, nil); !errors.As(err, &validationErr) {
 		t.Fatalf("empty prompt accepted: %v", err)
 	}
 	var modelErr *ModelSelectionError
-	if _, err := c.StartVideoJob("A cat", "unknown-model", VideoAspectLandscape); !errors.As(err, &modelErr) {
+	if _, err := c.StartVideoJob("A cat", "unknown-model", VideoAspectLandscape, nil); !errors.As(err, &modelErr) {
 		t.Fatalf("unknown model accepted: %v", err)
 	}
 	for _, tc := range []struct {
@@ -373,5 +373,61 @@ func TestMP4DurationReadsMovieHeader(t *testing.T) {
 	}
 	if got := mp4Duration(file[:20]); got != 0 {
 		t.Fatalf("truncated file duration = %v, want 0", got)
+	}
+}
+
+// tinyPNG is a minimal valid PNG header so DetectContentType reports image/png.
+var tinyPNG = append([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, make([]byte, 56)...)
+
+func TestStartVideoJobValidatesReferences(t *testing.T) {
+	var validationErr *VideoValidationError
+	run := &fakeVideoRun{release: make(chan struct{})}
+	c := NewVideoTestClient([]ModelInfo{{ID: "gemini-pro"}}, run.generate)
+	defer c.videoJobStore().close()
+
+	tooMany := make([]InputFile, maxVideoReferenceFiles+1)
+	for i := range tooMany {
+		tooMany[i] = InputFile{Name: "ref.png", MimeType: "image/png", Data: tinyPNG}
+	}
+	if _, err := c.StartVideoJob("A cat", "gemini-pro", VideoAspectLandscape, tooMany); !errors.As(err, &validationErr) {
+		t.Fatalf("too many references error = %v, want VideoValidationError", err)
+	} else if !strings.Contains(validationErr.Message, "at most") {
+		t.Fatalf("too many references message = %q", validationErr.Message)
+	}
+
+	notImage := []InputFile{{Name: "note.txt", MimeType: "text/plain", Data: []byte("hello")}}
+	if _, err := c.StartVideoJob("A cat", "gemini-pro", VideoAspectLandscape, notImage); !errors.As(err, &validationErr) {
+		t.Fatalf("non-image reference error = %v, want VideoValidationError", err)
+	}
+
+	empty := []InputFile{{Name: "ref.png", MimeType: "image/png"}}
+	if _, err := c.StartVideoJob("A cat", "gemini-pro", VideoAspectLandscape, empty); !errors.As(err, &validationErr) {
+		t.Fatalf("empty reference error = %v, want VideoValidationError", err)
+	}
+}
+
+func TestStartVideoJobPassesReferencesThrough(t *testing.T) {
+	var gotFiles []InputFile
+	done := make(chan struct{})
+	c := NewVideoTestClient([]ModelInfo{{ID: "gemini-pro"}},
+		func(ctx context.Context, prompt, model string, aspect VideoAspectRatio, files []InputFile) (*VideoResult, error) {
+			gotFiles = files
+			close(done)
+			return &VideoResult{Video: Video{MimeType: "video/mp4"}, Data: []byte("mp4")}, nil
+		})
+	defer c.videoJobStore().close()
+
+	files := []InputFile{{Name: "first.png", MimeType: "image/png", Data: tinyPNG}, {Name: "last.png", MimeType: "image/png", Data: tinyPNG}}
+	job, err := c.StartVideoJob("Animate this", "gemini-pro", VideoAspectLandscape, files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForVideoJob(t, c, job.ID, VideoJobCompleted)
+	<-done
+	if job.References != 2 {
+		t.Fatalf("job.References = %d, want 2", job.References)
+	}
+	if len(gotFiles) != 2 || gotFiles[0].Name != "first.png" || gotFiles[1].Name != "last.png" {
+		t.Fatalf("generate received files = %+v, want the two references in order", gotFiles)
 	}
 }

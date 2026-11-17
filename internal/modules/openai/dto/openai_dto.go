@@ -407,13 +407,17 @@ type ImageGenerationData struct {
 // accepted as JSON or as multipart/form-data (what the OpenAI SDK sends).
 // Size accepts "1280x720" (default) or "720x1280"; AspectRatio accepts
 // "16:9" or "9:16". Seconds is accepted for SDK compatibility and ignored:
-// Gemini Web decides the clip length.
+// Gemini Web decides the clip length. InputReference optionally carries up to
+// five reference images as data-URL or bare base64 strings. Multipart requests
+// must send images as "input_reference" file parts; the field deliberately has
+// no form tag so file parts are never bound into the string slice.
 type VideoGenerationRequest struct {
-	Model       string `json:"model,omitempty" form:"model"`
-	Prompt      string `json:"prompt" form:"prompt"`
-	Size        string `json:"size,omitempty" form:"size"`
-	Seconds     string `json:"seconds,omitempty" form:"seconds"`
-	AspectRatio string `json:"aspect_ratio,omitempty" form:"aspect_ratio"`
+	Model          string   `json:"model,omitempty" form:"model"`
+	Prompt         string   `json:"prompt" form:"prompt"`
+	Size           string   `json:"size,omitempty" form:"size"`
+	Seconds        string   `json:"seconds,omitempty" form:"seconds"`
+	AspectRatio    string   `json:"aspect_ratio,omitempty" form:"aspect_ratio"`
+	InputReference []string `json:"input_reference,omitempty"`
 }
 
 // Video mirrors the OpenAI Videos API object, plus Gemini-specific fields.

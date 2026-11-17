@@ -43,6 +43,10 @@ const (
 	maxConversationReadBytes   = 32 << 20
 	defaultVideoPollInterval   = 10 * time.Second
 	generatedVideoDownloadTime = 5 * time.Minute
+
+	// The Videos tool accepts at most five reference images per prompt.
+	maxVideoReferenceFiles     = 5
+	maxVideoReferenceFileBytes = 10 << 20
 )
 
 // VideoConfig selects Gemini Web's native video-generation tool.
@@ -306,12 +310,22 @@ func classifyVideoReply(text string) *VideoError {
 
 // GenerateVideo submits one video request with the native "Videos" tool, then
 // polls the same conversation until the video card appears and downloads it.
-// The prompt is never resubmitted, so one call consumes at most one quota unit.
-func (c *Client) GenerateVideo(ctx context.Context, prompt, model string, aspect VideoAspectRatio, pollInterval time.Duration) (*VideoResult, error) {
+// Up to five reference images guide the generation; they ride the same upload
+// path as chat attachments. The prompt is never resubmitted, so one call
+// consumes at most one quota unit.
+func (c *Client) GenerateVideo(ctx context.Context, prompt, model string, aspect VideoAspectRatio, files []InputFile, pollInterval time.Duration) (*VideoResult, error) {
+	if c.generateVideoFn != nil {
+		return c.generateVideoFn(ctx, prompt, model, aspect, files)
+	}
 	if pollInterval <= 0 {
 		pollInterval = defaultVideoPollInterval
 	}
-	response, err := c.GenerateContent(ctx, prompt, WithModel(model), WithVideoGeneration(aspect))
+	var options []GenerateOption
+	if len(files) > 0 {
+		options = append(options, WithInputFiles(files))
+	}
+	options = append(options, WithModel(model), WithVideoGeneration(aspect))
+	response, err := c.GenerateContent(ctx, prompt, options...)
 	if err != nil {
 		var modelErr *ModelSelectionError
 		if errors.As(err, &modelErr) {
@@ -440,7 +454,7 @@ func (c *Client) readConversationCandidates(ctx context.Context, conversationID 
 	request.Header.Set(geminiModelHeaderKey, string(headerJSON))
 	request.Header.Set("x-goog-ext-73010989-jspb", "[0]")
 
-	response, err := (&http.Client{Timeout: time.Minute}).Do(request)
+	response, err := c.plainHTTPClient("", time.Minute).Do(request)
 	if err != nil {
 		var requestErr *url.Error
 		if errors.As(err, &requestErr) {
@@ -541,12 +555,37 @@ func parseConversationCandidates(body []byte) ([][]interface{}, string) {
 	return found, text
 }
 
+// mediaHTTPClient downloads generated media through the account's egress,
+// keeping generatedImageHTTPClient's redirect guard (trusted Google media
+// hosts only) and re-sending the session cookie on each redirect hop.
+func (c *Client) mediaHTTPClient(timeout time.Duration, cookieHeader string) *http.Client {
+	c.mu.RLock()
+	proxyURL := c.proxyURL
+	c.mu.RUnlock()
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: resolveProxyTransport(proxyURL),
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many generated-media redirects")
+			}
+			if req.URL.Scheme != "https" || !isTrustedGoogleMediaHost(req.URL.Hostname()) {
+				return fmt.Errorf("refusing generated-media redirect to untrusted host")
+			}
+			if cookieHeader != "" {
+				req.Header.Set("Cookie", cookieHeader)
+			}
+			req.Header.Set("Referer", "https://gemini.google.com/")
+			return nil
+		},
+	}
+}
+
 func (c *Client) downloadGeneratedVideo(ctx context.Context, rawURL, cookieHeader string) ([]byte, error) {
 	if !trustedMediaURL(rawURL) {
 		return nil, fmt.Errorf("refusing generated-video download from untrusted host")
 	}
-	client := generatedImageHTTPClient(cookieHeader)
-	client.Timeout = generatedVideoDownloadTime
+	client := c.mediaHTTPClient(generatedVideoDownloadTime, cookieHeader)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
@@ -694,6 +733,7 @@ type VideoJob struct {
 	Model          string
 	Prompt         string
 	Aspect         VideoAspectRatio
+	References     int
 	CreatedAt      time.Time
 	CompletedAt    time.Time
 	ConversationID string
@@ -723,18 +763,19 @@ func (j VideoJob) ExpiresAt() time.Time {
 }
 
 // VideoGenerateFunc produces one video; it is GenerateVideo in production.
-type VideoGenerateFunc func(ctx context.Context, prompt, model string, aspect VideoAspectRatio) (*VideoResult, error)
+type VideoGenerateFunc func(ctx context.Context, prompt, model string, aspect VideoAspectRatio, files []InputFile) (*VideoResult, error)
 
 type videoJobEntry struct {
 	job  VideoJob
 	data []byte
 }
 
-// videoJobStore keeps jobs in memory. Gemini Web allows few videos per day,
-// so only one job runs at a time.
+// videoJobStore keeps jobs in memory. Single-account mode runs one job at a
+// time; pool mode raises the ceiling to the pool's total per-account slots.
 type videoJobStore struct {
-	generate VideoGenerateFunc
-	timeout  time.Duration
+	generate  VideoGenerateFunc
+	timeout   time.Duration
+	maxActive int
 
 	mu     sync.Mutex
 	jobs   map[string]*videoJobEntry
@@ -742,6 +783,24 @@ type videoJobStore struct {
 	root   context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+// setMaxActive raises the concurrent-job ceiling (pool mode); it is called
+// before the store is first used and never lowered below one.
+func (s *videoJobStore) setMaxActive(n int) {
+	s.mu.Lock()
+	if n > s.maxActive {
+		s.maxActive = n
+	}
+	s.mu.Unlock()
+}
+
+// setGenerate swaps the worker function (pool mode routes it through the
+// account scheduler). It must be called before the first job starts.
+func (s *videoJobStore) setGenerate(generate VideoGenerateFunc) {
+	s.mu.Lock()
+	s.generate = generate
+	s.mu.Unlock()
 }
 
 // newVideoJobStore runs jobs with generate, each bounded by timeout (zero means
@@ -756,8 +815,8 @@ func newVideoJobStore(generate VideoGenerateFunc, timeout time.Duration) *videoJ
 
 func (c *Client) videoJobStore() *videoJobStore {
 	c.videoJobsOnce.Do(func() {
-		c.videoJobs = newVideoJobStore(func(ctx context.Context, prompt, model string, aspect VideoAspectRatio) (*VideoResult, error) {
-			return c.GenerateVideo(ctx, prompt, model, aspect, 0)
+		c.videoJobs = newVideoJobStore(func(ctx context.Context, prompt, model string, aspect VideoAspectRatio, files []InputFile) (*VideoResult, error) {
+			return c.GenerateVideo(ctx, prompt, model, aspect, files, 0)
 		}, c.videoJobTimeout)
 	})
 	return c.videoJobs
@@ -805,7 +864,8 @@ func ParseVideoAspect(size, aspectRatio string) (VideoAspectRatio, error) {
 }
 
 // StartVideoJob validates the request and generates the video in the background.
-func (c *Client) StartVideoJob(prompt, model string, aspect VideoAspectRatio) (VideoJob, error) {
+// files are optional reference images (at most five) that guide the generation.
+func (c *Client) StartVideoJob(prompt, model string, aspect VideoAspectRatio, files []InputFile) (VideoJob, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return VideoJob{}, &VideoValidationError{Message: "prompt is required"}
@@ -816,6 +876,9 @@ func (c *Client) StartVideoJob(prompt, model string, aspect VideoAspectRatio) (V
 	if aspect != VideoAspectPortrait {
 		aspect = VideoAspectLandscape
 	}
+	if err := validateVideoReferences(files); err != nil {
+		return VideoJob{}, err
+	}
 	// SDK defaults name the official video models; Gemini Web always uses its
 	// own video model, so route those names to the account's default model.
 	if lower := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(model), "models/")); strings.HasPrefix(lower, "sora") || strings.HasPrefix(lower, "veo") {
@@ -825,7 +888,37 @@ func (c *Client) StartVideoJob(prompt, model string, aspect VideoAspectRatio) (V
 	if err != nil {
 		return VideoJob{}, err
 	}
-	return c.videoJobStore().start(prompt, resolved.ID, aspect)
+	return c.videoJobStore().start(prompt, resolved.ID, aspect, files)
+}
+
+// MaxVideoReferenceFiles exposes the reference-image count cap for API layers.
+func MaxVideoReferenceFiles() int { return maxVideoReferenceFiles }
+
+// MaxVideoReferenceFileBytes exposes the per-image size cap for API layers.
+func MaxVideoReferenceFileBytes() int { return maxVideoReferenceFileBytes }
+
+// validateVideoReferences checks the reference-image constraints of the Videos
+// tool: at most five images, each a non-empty image under the size cap.
+func validateVideoReferences(files []InputFile) error {
+	if len(files) > maxVideoReferenceFiles {
+		return &VideoValidationError{Message: fmt.Sprintf("at most %d reference images are supported", maxVideoReferenceFiles)}
+	}
+	for i, file := range files {
+		if len(file.Data) == 0 {
+			return &VideoValidationError{Message: fmt.Sprintf("reference image %d is empty", i+1)}
+		}
+		if len(file.Data) > maxVideoReferenceFileBytes {
+			return &VideoValidationError{Message: fmt.Sprintf("reference image %d exceeds %d bytes", i+1, maxVideoReferenceFileBytes)}
+		}
+		mimeType := file.MimeType
+		if mimeType == "" {
+			mimeType = http.DetectContentType(file.Data)
+		}
+		if !strings.HasPrefix(mimeType, "image/") {
+			return &VideoValidationError{Message: fmt.Sprintf("reference image %d is not an image (%s)", i+1, mimeType)}
+		}
+	}
+	return nil
 }
 
 // GetVideoJob returns the current state of a job.
@@ -848,27 +941,30 @@ func (c *Client) DeleteVideoJob(id string) error {
 	return c.videoJobStore().delete(id)
 }
 
-func (s *videoJobStore) start(prompt, model string, aspect VideoAspectRatio) (VideoJob, error) {
+func (s *videoJobStore) start(prompt, model string, aspect VideoAspectRatio, files []InputFile) (VideoJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pruneLocked(time.Now())
 	if s.root.Err() != nil {
 		return VideoJob{}, errors.New("server is shutting down")
 	}
-	if s.active > 0 {
+	if s.maxActive <= 0 {
+		s.maxActive = 1
+	}
+	if s.active >= s.maxActive {
 		return VideoJob{}, ErrVideoBusy
 	}
 	// Lowercase hex only: google-genai extracts file names with [a-z0-9]+.
 	id := strings.ReplaceAll(uuid.NewString(), "-", "")
-	entry := &videoJobEntry{job: VideoJob{ID: id, Status: VideoJobInProgress, Model: model, Prompt: prompt, Aspect: aspect, CreatedAt: time.Now()}}
+	entry := &videoJobEntry{job: VideoJob{ID: id, Status: VideoJobInProgress, Model: model, Prompt: prompt, Aspect: aspect, References: len(files), CreatedAt: time.Now()}}
 	s.jobs[id] = entry
 	s.active++
 	s.wg.Add(1)
-	go s.run(id, prompt, model, aspect)
+	go s.run(id, prompt, model, aspect, files)
 	return entry.job, nil
 }
 
-func (s *videoJobStore) run(id, prompt, model string, aspect VideoAspectRatio) {
+func (s *videoJobStore) run(id, prompt, model string, aspect VideoAspectRatio, files []InputFile) {
 	defer s.wg.Done()
 	ctx, cancel := context.WithTimeout(s.root, s.timeout)
 	defer cancel()
@@ -881,7 +977,7 @@ func (s *videoJobStore) run(id, prompt, model string, aspect VideoAspectRatio) {
 				err = fmt.Errorf("video worker panic: %v", r)
 			}
 		}()
-		result, err = s.generate(ctx, prompt, model, aspect)
+		result, err = s.generate(ctx, prompt, model, aspect, files)
 	}()
 
 	s.mu.Lock()

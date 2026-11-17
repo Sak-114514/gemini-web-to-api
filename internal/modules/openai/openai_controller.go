@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"path/filepath"
 	"time"
 
 	models "gemini-web-to-api/internal/commons/models"
@@ -236,15 +238,41 @@ func (h *OpenAIController) HandleCreateVideo(c fiber.Ctx) error {
 	if err := c.Bind().Body(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(fmt.Errorf("invalid request body: %w", err), "invalid_request_error"))
 	}
-	if form, err := c.MultipartForm(); err == nil && len(form.File["input_reference"]) > 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(errors.New("input_reference is not supported; only text-to-video is available"), "invalid_request_error"))
-	}
-	video, err := h.service.CreateVideo(req)
+	files := parseVideoReferenceUploads(c)
+	video, err := h.service.CreateVideo(req, files)
 	if err != nil {
 		h.log.Warn("CreateVideo failed", zap.Error(err), zap.String("model", req.Model))
 		return videoRequestError(c, err)
 	}
 	return c.JSON(video)
+}
+
+// parseVideoReferenceUploads turns multipart "input_reference" file parts into
+// provider inputs. Non-multipart bodies and forms without the field return nil.
+func parseVideoReferenceUploads(c fiber.Ctx) []providers.InputFile {
+	form, err := c.MultipartForm()
+	if err != nil || len(form.File["input_reference"]) == 0 {
+		return nil
+	}
+	headers := form.File["input_reference"]
+	files := make([]providers.InputFile, 0, len(headers))
+	for i, header := range headers {
+		part, err := header.Open()
+		if err != nil {
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(part, int64(providers.MaxVideoReferenceFileBytes()+1)))
+		part.Close()
+		if err != nil || len(data) == 0 || len(data) > providers.MaxVideoReferenceFileBytes() {
+			continue
+		}
+		name := filepath.Base(header.Filename)
+		if name == "" || name == "." {
+			name = fmt.Sprintf("reference_%d", i+1)
+		}
+		files = append(files, providers.InputFile{Name: name, MimeType: header.Header.Get("Content-Type"), Data: data})
+	}
+	return files
 }
 
 // HandleListVideos lists retained video jobs

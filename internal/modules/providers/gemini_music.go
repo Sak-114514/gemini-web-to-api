@@ -298,6 +298,14 @@ func (c *Client) GenerateMusic(ctx context.Context, prompt, model string, config
 		return nil, err
 	}
 	model, _ = splitMusicModel(model)
+	c.mu.RLock()
+	pool := c.pool
+	c.mu.RUnlock()
+	if pool != nil {
+		if target := pool.pickForChat(); target != nil && target != c {
+			return target.GenerateMusic(ctx, prompt, model, config)
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, musicJobTimeout)
 	defer cancel()
 

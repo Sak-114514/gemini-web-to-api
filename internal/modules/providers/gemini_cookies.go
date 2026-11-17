@@ -226,8 +226,11 @@ func (c *Client) checkSession(ctx context.Context, header, psid, psidts string) 
 		return nil, nil
 	}
 
+	c.mu.RLock()
+	probeProxy := c.proxyURL
+	c.mu.RUnlock()
 	probe := &Client{
-		httpClient:             req.NewClient().SetTimeout(10 * time.Minute).SetCommonHeaders(DefaultHeaders),
+		httpClient:             applyGeminiProxy(req.NewClient().SetTimeout(10 * time.Minute).SetCommonHeaders(DefaultHeaders), probeProxy, c.log),
 		cookies:                &CookieStore{Secure1PSID: psid, Secure1PSIDTS: psidts, UpdatedAt: time.Now()},
 		configuredCookieHeader: header,
 		authUser:               c.authUser,

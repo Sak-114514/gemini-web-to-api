@@ -29,11 +29,15 @@ name from `/openai/v1/models` also works.
 
 | Method & path                          | Notes                                                                  |
 | -------------------------------------- | ---------------------------------------------------------------------- |
-| `POST /openai/v1/videos`               | JSON or multipart. `prompt` (required, ≤ 8000 bytes), `model`, `size` (`1280x720` / `720x1280`) or `aspect_ratio` (`16:9` / `9:16`). `seconds` is accepted and ignored. |
+| `POST /openai/v1/videos`               | JSON or multipart. `prompt` (required, ≤ 8000 bytes), `model`, `size` (`1280x720` / `720x1280`) or `aspect_ratio` (`16:9` / `9:16`). `seconds` is accepted and ignored. Reference images: multipart `input_reference` file parts (≤ 5) or JSON `input_reference: ["data:image/png;base64,…"]`. |
 | `GET /openai/v1/videos/{id}`           | Job status. `progress` is an estimate while `in_progress`.             |
 | `GET /openai/v1/videos/{id}/content`   | The MP4. `409` until completed. Only `variant=video` exists.            |
 | `GET /openai/v1/videos`                | Retained jobs, newest first.                                            |
 | `DELETE /openai/v1/videos/{id}`        | Discards a finished job.                                                |
+
+Reference images guide the generation like the web app's photo-to-video: up to
+five images, each ≤ 10 MB, image MIME types only. They are guidance, not hard
+keyframes.
 
 Plain HTTP:
 
@@ -90,7 +94,7 @@ video.save("cat.mp4")
 
 | Method & path                                          | Notes                                                       |
 | ------------------------------------------------------ | ----------------------------------------------------------- |
-| `POST /gemini/v1beta/models/{model}:predictLongRunning` | `instances[0].prompt`, `parameters.aspectRatio`. Image/video inputs and `sampleCount > 1` are rejected; `durationSeconds`, `resolution`, `negativePrompt` are ignored. |
+| `POST /gemini/v1beta/models/{model}:predictLongRunning` | `instances[0].prompt`, `parameters.aspectRatio`. `instances[0].image` and `instances[0].lastFrame` accept `{bytesBase64Encoded, mimeType}` reference images (`gcsUri` and `sampleCount > 1` are rejected; `durationSeconds`, `resolution`, `negativePrompt` are ignored). `lastFrame` is forwarded as a trailing reference image — the Videos tool has no strict end-frame conditioning. |
 | `GET /gemini/v1beta/models/{model}/operations/{id}`    | Long-running operation; `response.generateVideoResponse.generatedSamples[0].video.uri` when done. |
 | `GET /gemini/v1beta/files/{id}:download?alt=media`     | The MP4.                                                    |
 
@@ -130,5 +134,5 @@ A failed job carries a code (OpenAI `error.code`; Gemini `error.status`):
 - One video job at a time per server; jobs live in memory and are lost on restart.
 - Finished jobs and their MP4 are kept for one hour (at most 20 jobs).
 - Video is 1280x720 or 720x1280, about 10 seconds, with audio, as decided by Gemini.
-- Text-to-video only: no image/video input, duration, resolution or multiple-video controls.
+- Up to five reference images per job (≤ 10 MB each, image MIME only). They ride the same upload path as chat attachments and guide the generation like the web app's photo-to-video; they are not hard first/last keyframes. Video input, duration, resolution and multiple-video controls remain unsupported.
 - The API has no authentication of its own; keep the server on localhost or put it behind your own auth.

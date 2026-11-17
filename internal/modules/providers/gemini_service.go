@@ -61,6 +61,9 @@ type Client struct {
 	// sessionValidator is a test seam for UpdateCookies; nil uses the real
 	// Google session check.
 	sessionValidator func(ctx context.Context, cookieHeader string) error
+	// generateVideoFn is a test seam for GenerateVideo; nil uses the real
+	// Gemini Web video flow. Pool tests use it to fake per-account replies.
+	generateVideoFn func(ctx context.Context, prompt, model string, aspect VideoAspectRatio, files []InputFile) (*VideoResult, error)
 
 	// sessionMu serializes the operations that replace the Gemini session
 	// (Init, the refresh loop and UpdateCookies), so none of them overwrites
@@ -75,6 +78,13 @@ type Client struct {
 
 	videoJobsOnce sync.Once
 	videoJobs     *videoJobStore
+
+	// pool spreads traffic across several accounts when GEMINI_POOL_CONFIG
+	// is set; nil keeps classic single-account behavior.
+	pool *ClientPool
+	// proxyURL is this account's dedicated egress (pool mode); empty falls
+	// back to GEMINI_PROXY_URL / direct.
+	proxyURL string
 	// videoJobTimeout bounds one video job (GEMINI_VIDEO_TIMEOUT_MINUTES);
 	// zero means defaultVideoJobTimeout.
 	videoJobTimeout time.Duration
@@ -115,7 +125,15 @@ func NewClientWithSessionValidator(cfg *configs.Config, log *zap.Logger, validat
 	return newClient(cfg, log, validate)
 }
 
+// newClient builds the root client; only the root reads GEMINI_POOL_CONFIG so
+// pool members never recurse into building pools of their own.
 func newClient(cfg *configs.Config, log *zap.Logger, validate func(ctx context.Context, cookieHeader string) error) *Client {
+	return newClientCore(cfg, log, validate, true)
+}
+
+// newClientCore constructs one account client; allowPool=false is used for
+// pool members.
+func newClientCore(cfg *configs.Config, log *zap.Logger, validate func(ctx context.Context, cookieHeader string) error, allowPool bool) *Client {
 	cookies := &CookieStore{
 		Secure1PSID:   cfg.Gemini.Secure1PSID,
 		Secure1PSIDTS: cfg.Gemini.Secure1PSIDTS,
@@ -123,16 +141,16 @@ func newClient(cfg *configs.Config, log *zap.Logger, validate func(ctx context.C
 		Source:        CookieSourceEnv,
 	}
 
-	client := req.NewClient().
+	client := applyGeminiProxy(req.NewClient().
 		SetTimeout(10 * time.Minute).
-		SetCommonHeaders(DefaultHeaders)
+		SetCommonHeaders(DefaultHeaders), "", log)
 
 	refreshIntervalMinutes := cfg.Gemini.RefreshInterval
 	if refreshIntervalMinutes <= 0 {
 		refreshIntervalMinutes = defaultRefreshIntervalMinutes
 	}
 
-	return &Client{
+	c := &Client{
 		httpClient:             client,
 		cookies:                cookies,
 		videoJobTimeout:        time.Duration(cfg.Gemini.VideoTimeoutMinutes) * time.Minute,
@@ -147,9 +165,76 @@ func newClient(cfg *configs.Config, log *zap.Logger, validate func(ctx context.C
 		sessionValidator:       validate,
 		envCookieHash:          cookieHeaderHash(cfg.Gemini.Cookies),
 	}
+	if allowPool {
+		if poolConfig := LoadPoolConfig(strings.TrimSpace(os.Getenv("GEMINI_POOL_CONFIG")), log); poolConfig != nil {
+			c.attachPool(poolConfig, cfg, log)
+		}
+	}
+	return c
 }
 
+// attachPool switches the client to multi-account mode: the facade routes
+// traffic across members and video jobs gain per-account concurrency.
+func (c *Client) attachPool(config *PoolConfig, cfg *configs.Config, log *zap.Logger) {
+	pool := newClientPool(config, c, cfg, log)
+	c.mu.Lock()
+	c.pool = pool
+	c.mu.Unlock()
+	store := c.videoJobStore()
+	store.setMaxActive(len(pool.members) * pool.sched.MaxConcurrentPerAccount)
+	store.setGenerate(pool.generateVideoOnPool)
+	log.Info("Gemini account pool enabled",
+		zap.Int("accounts", len(pool.members)),
+		zap.Int("per_account_concurrency", pool.sched.MaxConcurrentPerAccount))
+}
+
+// applyGeminiProxy routes a req client through explicit (pool account) or
+// GEMINI_PROXY_URL when set, so deployments without direct Google access
+// (e.g. containers behind a local proxy) can reach gemini.google.com. Plain
+// net/http clients in this package already honor HTTPS_PROXY through the
+// default transport; pool members use Client.plainHTTPClient instead.
+func applyGeminiProxy(client *req.Client, explicit string, log *zap.Logger) *req.Client {
+	proxyURL := strings.TrimSpace(explicit)
+	if proxyURL == "" {
+		proxyURL = strings.TrimSpace(os.Getenv("GEMINI_PROXY_URL"))
+	}
+	if proxyURL == "" {
+		return client
+	}
+	log.Info("Routing Gemini traffic through proxy", zap.String("proxy_url", proxyURL))
+	return client.SetProxyURL(proxyURL)
+}
+
+// Init initializes the account session — or, in pool mode, every member's
+// session sequentially with a stagger so the fleet does not look synchronized.
 func (c *Client) Init(ctx context.Context) error {
+	c.mu.RLock()
+	pool := c.pool
+	c.mu.RUnlock()
+	if pool == nil {
+		return c.initAccount(ctx)
+	}
+	var firstErr error
+	for i, member := range pool.members {
+		if i > 0 {
+			if err := sleepContext(ctx, time.Duration(3+rand.Intn(9))*time.Second); err != nil {
+				return err
+			}
+		}
+		if err := member.client.initAccount(ctx); err != nil {
+			member.setHealthy(false)
+			if firstErr == nil {
+				firstErr = err
+			}
+			c.log.Error("Pool account initialization failed", zap.String("account", member.id), zap.Error(err))
+			continue
+		}
+		member.setHealthy(true)
+	}
+	return firstErr
+}
+
+func (c *Client) initAccount(ctx context.Context) error {
 	c.sessionMu.Lock()
 	defer c.sessionMu.Unlock()
 
@@ -252,9 +337,12 @@ func (c *Client) refreshSessionTokenCompat(ctx context.Context) error {
 
 func (c *Client) refreshSessionToken(ctx context.Context) error {
 	// 1. Initial hit to google.com to get extra cookies (NID, etc)
-	tmpClient := req.NewClient().
+	c.mu.RLock()
+	accountProxy := c.proxyURL
+	c.mu.RUnlock()
+	tmpClient := applyGeminiProxy(req.NewClient().
 		SetTimeout(30 * time.Second).
-		SetUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		SetUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"), accountProxy, c.log)
 
 	resp1, err := tmpClient.R().SetContext(ctx).Get("https://www.google.com/")
 	extraCookies := ""
@@ -576,6 +664,16 @@ func (c *Client) GetCookies() *CookieStore {
 }
 
 func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...GenerateOption) (*Response, error) {
+	// In pool mode single-shot traffic rides a random eligible account; chat
+	// sessions (StartChat) intentionally stay on the facade for continuity.
+	c.mu.RLock()
+	pool := c.pool
+	c.mu.RUnlock()
+	if pool != nil {
+		if target := pool.pickForChat(); target != nil && target != c {
+			return target.GenerateContent(ctx, prompt, options...)
+		}
+	}
 	return c.generateContent(ctx, prompt, nil, options...)
 }
 
@@ -1046,6 +1144,16 @@ func (c *Client) StartChat(options ...ChatOption) ChatSession {
 }
 
 func (c *Client) Close() error {
+	c.mu.RLock()
+	pool := c.pool
+	c.mu.RUnlock()
+	if pool != nil {
+		for _, member := range pool.members {
+			if member.client != c {
+				_ = member.client.Close()
+			}
+		}
+	}
 	c.videoJobStore().close()
 	close(c.stopRefresh)
 	c.mu.Lock()

@@ -121,7 +121,7 @@ func TestGeminiBuildPrompt(t *testing.T) {
 func TestVideoOperationMatchesGoogleGenAI(t *testing.T) {
 	var gotAspect providers.VideoAspectRatio
 	client := providers.NewVideoTestClient([]providers.ModelInfo{{ID: "gemini-pro"}},
-		func(ctx context.Context, prompt, model string, aspect providers.VideoAspectRatio) (*providers.VideoResult, error) {
+		func(ctx context.Context, prompt, model string, aspect providers.VideoAspectRatio, files []providers.InputFile) (*providers.VideoResult, error) {
 			gotAspect = aspect
 			return &providers.VideoResult{Video: providers.Video{MimeType: "video/mp4"}, Data: []byte("mp4-bytes")}, nil
 		})

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -306,17 +307,64 @@ const openAIVideoIDPrefix = "video_"
 // expectedVideoSeconds is how long Gemini Web usually takes, for progress.
 const expectedVideoSeconds = 90
 
-// CreateVideo starts a background video job (OpenAI Videos API).
-func (s *OpenAIService) CreateVideo(req dto.VideoGenerationRequest) (*dto.Video, error) {
+// CreateVideo starts a background video job (OpenAI Videos API). uploads are
+// reference images collected from multipart parts; req.InputReference carries
+// the same concept as data-URL or bare base64 strings.
+func (s *OpenAIService) CreateVideo(req dto.VideoGenerationRequest, uploads []providers.InputFile) (*dto.Video, error) {
 	aspect, err := providers.ParseVideoAspect(req.Size, req.AspectRatio)
 	if err != nil {
 		return nil, err
 	}
-	job, err := s.client.StartVideoJob(req.Prompt, req.Model, aspect)
+	files, err := videoReferenceFiles(req.InputReference, uploads)
+	if err != nil {
+		return nil, err
+	}
+	job, err := s.client.StartVideoJob(req.Prompt, req.Model, aspect, files)
 	if err != nil {
 		return nil, err
 	}
 	return toOpenAIVideo(job, time.Now()), nil
+}
+
+// videoReferenceFiles merges base64 reference strings with multipart uploads.
+func videoReferenceFiles(references []string, uploads []providers.InputFile) ([]providers.InputFile, error) {
+	if len(references) == 0 {
+		return uploads, nil
+	}
+	files := append([]providers.InputFile(nil), uploads...)
+	for i, reference := range references {
+		data, mimeType, err := decodeReferenceString(reference)
+		if err != nil {
+			return nil, fmt.Errorf("input_reference[%d]: %w", i, err)
+		}
+		files = append(files, providers.InputFile{Name: fmt.Sprintf("reference_%d", i+1), MimeType: mimeType, Data: data})
+	}
+	return files, nil
+}
+
+// decodeReferenceString accepts data URLs ("data:image/png;base64,…") and bare
+// base64 payloads; the MIME type defaults to sniffed content when absent.
+func decodeReferenceString(reference string) ([]byte, string, error) {
+	value := strings.TrimSpace(reference)
+	if value == "" {
+		return nil, "", errors.New("empty reference image")
+	}
+	mimeType := ""
+	if prefix, rest, found := strings.Cut(value, ","); found && strings.HasPrefix(prefix, "data:") {
+		mimeType = strings.TrimPrefix(prefix, "data:")
+		if meta, _, ok := strings.Cut(mimeType, ";"); ok {
+			mimeType = meta
+		}
+		value = rest
+	}
+	data, err := providers.DecodeBase64Data(value)
+	if err != nil {
+		return nil, "", err
+	}
+	if mimeType == "" {
+		mimeType = http.DetectContentType(data)
+	}
+	return data, mimeType, nil
 }
 
 // GetVideo returns a video job by OpenAI ID.
